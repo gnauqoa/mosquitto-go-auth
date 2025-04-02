@@ -3,6 +3,25 @@
 ARG MOSQUITTO_VERSION=2.0.18
 # Define libwebsocket version
 ARG LWS_VERSION=4.2.2
+# PostgreSQL configuration ARGs
+ARG DATABASE_HOST
+ARG DATABASE_PORT
+ARG DATABASE_NAME
+ARG DATABASE_USERNAME
+ARG DATABASE_PASSWORD
+ARG DATABASE_CONNECT_TRIES
+ARG DATABASE_SSL_MODE
+
+# Auth configuration ARGs
+ARG AUTH_LOG_LEVEL
+ARG AUTH_CHECK_PREFIX
+ARG AUTH_HASHER
+ARG AUTH_HASHER_COST
+
+# PostgreSQL query configuration ARGs
+ARG AUTH_PG_USERQUERY
+ARG AUTH_PG_ACLQUERY
+ARG AUTH_PG_SUPERQUERY
 
 # Use debian:stable-slim as a builder for Mosquitto and dependencies.
 FROM debian:stable-slim as mosquitto_builder
@@ -93,6 +112,21 @@ RUN set -ex; \
 
 #Start from a new image.
 FROM debian:stable-slim
+# Set environment variables with ARG defaults
+ENV DATABASE_HOST=${DATABASE_HOST:-postgres}
+ENV DATABASE_PORT=${DATABASE_PORT:-5432}
+ENV DATABASE_NAME=${DATABASE_NAME:-mqtt}
+ENV DATABASE_USERNAME=${DATABASE_USERNAME:-mqtt}
+ENV DATABASE_PASSWORD=${DATABASE_PASSWORD:-mqtt}
+ENV DATABASE_CONNECT_TRIES=${DATABASE_CONNECT_TRIES:-5}
+ENV DATABASE_SSL_MODE=${DATABASE_SSL_MODE:-disable}
+ENV AUTH_LOG_LEVEL=${AUTH_LOG_LEVEL:-debug}
+ENV AUTH_CHECK_PREFIX=${AUTH_CHECK_PREFIX:-false}
+ENV AUTH_HASHER=${AUTH_HASHER:-bcrypt}
+ENV AUTH_HASHER_COST=${AUTH_HASHER_COST:-10}
+ENV AUTH_PG_USERQUERY=${AUTH_PG_USERQUERY:-'SELECT "deviceToken" FROM "device" WHERE "deviceKey" = $1 limit 1'}
+ENV AUTH_PG_ACLQUERY=${AUTH_PG_ACLQUERY:-'SELECT "topic" FROM "mqtt_acl" acl JOIN "device" on acl."deviceId" = "device".id WHERE "device"."deviceKey" = $1 and (acl.rw = $2 or acl.rw = 999)'}
+ENV AUTH_PG_SUPERQUERY=${AUTH_PG_SUPERQUERY:-'SELECT count(*) FROM "device" WHERE "deviceKey" = $1 and "role" = 1'}
 
 RUN set -ex; \
     apt update; \
@@ -104,6 +138,38 @@ RUN set -ex; \
     useradd -s /sbin/nologin mosquitto -g mosquitto -d /var/lib/mosquitto; \
     chown -R mosquitto:mosquitto /var/log/mosquitto/; \
     chown -R mosquitto:mosquitto /var/lib/mosquitto/
+
+# Create mosquitto config directory
+RUN mkdir -p /etc/mosquitto
+
+# Create a script to generate mosquitto.conf from environment variables
+RUN echo '#!/bin/sh\n\
+echo "listener 1883\n\
+protocol mqtt\n\
+allow_anonymous false\n\
+\n\
+auth_plugin /mosquitto/go-auth.so\n\
+auth_opt_log_level ${AUTH_LOG_LEVEL}\n\
+\n\
+auth_opt_backends postgres\n\
+auth_opt_check_prefix ${AUTH_CHECK_PREFIX}\n\
+allow_anonymous false\n\
+\n\
+auth_opt_pg_host ${DATABASE_HOST}\n\
+auth_opt_pg_port ${DATABASE_PORT}\n\
+auth_opt_pg_dbname ${DATABASE_NAME}\n\
+auth_opt_pg_user ${DATABASE_USERNAME}\n\
+auth_opt_pg_password ${DATABASE_PASSWORD}\n\
+\n\
+auth_opt_pg_connect_tries ${DATABASE_CONNECT_TRIES}\n\
+auth_opt_pg_sslmode ${DATABASE_SSL_MODE}\n\
+auth_opt_pg_userquery ${AUTH_PG_USERQUERY}\n\
+auth_opt_pg_aclquery ${AUTH_PG_ACLQUERY}\n\
+auth_opt_pg_superquery ${AUTH_PG_SUPERQUERY}\n\
+\n\
+auth_opt_hasher ${AUTH_HASHER}\n\
+auth_opt_hasher_cost ${AUTH_HASHER_COST}" > /etc/mosquitto/mosquitto.conf' > /usr/local/bin/generate-config.sh && \
+    chmod +x /usr/local/bin/generate-config.sh
 
 #Copy confs, plugin so and mosquitto binary.
 COPY --from=mosquitto_builder /app/mosquitto/ /mosquitto/
@@ -119,8 +185,7 @@ COPY --from=mosquitto_builder /usr/local/bin/mosquitto_pub /usr/bin/mosquitto_pu
 COPY --from=mosquitto_builder /usr/local/bin/mosquitto_rr /usr/bin/mosquitto_rr
 
 RUN ldconfig;
-
 EXPOSE 1883 1884
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD [ "/usr/sbin/mosquitto" ,"-c", "/etc/mosquitto/mosquitto.conf" ]
+CMD ["/bin/sh", "-c", "/usr/local/bin/generate-config.sh && /usr/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf"]
